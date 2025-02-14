@@ -1,4 +1,4 @@
-Objetivo do Projeto
+Objetivo do Projeto:
 
 O objetivo principal deste projeto é criar um modelo LLM capaz de gerar narrativas personalizadas com base nas preferências do usuário. Para garantir que as histórias sejam coerentes e dentro do universo Star Wars, o sistema:
 
