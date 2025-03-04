@@ -1,5 +1,4 @@
 #%%
-
 import json
 import boto3
 import requests
@@ -8,131 +7,146 @@ import os
 import zipfile
 import time
 import subprocess
+import logging
 from dotenv import load_dotenv
+from concurrent.futures import ThreadPoolExecutor
 
 #%%
-# Criar .env se não existir
-env_path = ".env"
-if not os.path.exists(env_path):
-    with open(env_path, "w") as env_file:
-        env_file.write(f"""
-AWS_ACCESS_KEY_ID={os.getenv('AWS_ACCESS_KEY_ID', '')}
-AWS_SECRET_ACCESS_KEY={os.getenv('AWS_SECRET_ACCESS_KEY', '')}
-AWS_DEFAULT_REGION={os.getenv('AWS_DEFAULT_REGION', 'us-east-1')}
-OPENAI_API_KEY={os.getenv('OPENAI_API_KEY', '')}
-AWS_ACCOUNT_ID={os.getenv('AWS_ACCOUNT_ID', '')}
-""")
-    print("⚠️ O arquivo .env foi criado. Adicione suas credenciais nele antes de rodar o script novamente.")
-    exit()
+# Configuração do logger para monitoramento no AWS CloudWatch
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
 
-#%%
-# Carregar variáveis de ambiente
-load_dotenv()
+#%% 
+# Criar cliente do AWS Secrets Manager
+secrets_client = boto3.client("secretsmanager", region_name="us-east-1")
 
-AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
-AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
-AWS_REGION = os.getenv("AWS_DEFAULT_REGION", "us-east-1")
-AWS_ACCOUNT_ID = os.getenv("AWS_ACCOUNT_ID")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+def get_secret(secret_name):
+    """
+    Recupera um segredo armazenado no AWS Secrets Manager.
+    Se não for encontrado, exibe um erro e encerra a execução.
+    """
+    try:
+        response = secrets_client.get_secret_value(SecretId=secret_name)
+        secret = json.loads(response["SecretString"])
+        return secret
+    except secrets_client.exceptions.ResourceNotFoundException:
+        logger.error(f"❌ ERRO: O segredo '{secret_name}' não foi encontrado no AWS Secrets Manager.")
+        exit(1)
+    except Exception as e:
+        logger.error(f"❌ ERRO ao recuperar segredo: {e}")
+        exit(1)
 
-if not AWS_ACCESS_KEY or not AWS_SECRET_KEY or not OPENAI_API_KEY or not AWS_ACCOUNT_ID:
-    print("❌ Erro: Credenciais ausentes no .env!")
-    exit()
+# Obtendo credenciais de forma segura
+secrets = get_secret("StarWarsStorySecret")
 
-#%%
+# Definir as chaves API
+OPENAI_API_KEY = secrets.get("OPENAI_API_KEY")
+AWS_ACCESS_KEY = secrets.get("AWS_ACCESS_KEY_ID")
+AWS_SECRET_KEY = secrets.get("AWS_SECRET_ACCESS_KEY")
+AWS_REGION = secrets.get("AWS_DEFAULT_REGION", "us-east-1")
+AWS_ACCOUNT_ID = secrets.get("AWS_ACCOUNT_ID")
+
+if not OPENAI_API_KEY or not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
+    logger.error("❌ ERRO: Algumas credenciais não foram carregadas corretamente.")
+    exit(1)
+
+# Configurar OpenAI
+openai.api_key = OPENAI_API_KEY
+
+#%% 
+
 # Criando clientes AWS
 lambda_client = boto3.client("lambda", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY, region_name=AWS_REGION)
 apigateway_client = boto3.client("apigateway", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY, region_name=AWS_REGION)
 iam_client = boto3.client("iam", aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY, region_name=AWS_REGION)
 
-#%%
+#%% 
+
 # Instalar dependências na pasta package/
 def install_dependencies():
-    """
-    Instala todas as dependências no diretório `package/` antes de empacotar.
-    """
-    dependencies = ["requests", "openai==0.28.0", "boto3", "pydantic==1.9.0", "python-dotenv", "jiter"]
-    
+    dependencies = ["requests", "openai==0.28.0", "boto3", "pydantic==1.9.0", "python-dotenv"]
     try:
         subprocess.run(["pip", "install", "-t", "package"] + dependencies, check=True)
-        print("✅ Dependências instaladas com sucesso!")
+        logger.info("✅ Dependências instaladas com sucesso!")
     except subprocess.CalledProcessError as e:
-        print(f"❌ Erro ao instalar dependências: {e}")
+        logger.error(f"❌ Erro ao instalar dependências: {e}")
         exit(1)
 
-#%%
+#%% 
+
 # Configuração AWS
 LAMBDA_FUNCTION_NAME = "StarWarsStoryLambda"
 API_NAME = "StarWarsAPI"
 STAGE_NAME = "prod"
 
-#%%
-# Código da Lambda corrigido para OpenAI 0.28.0
-import json
-import requests
-import openai
-import os
-import boto3
+#%% 
 
-#%%
 # Criar cliente para acessar a AWS Lambda
 lambda_client = boto3.client("lambda", region_name="us-east-1")
 
-#%%
-# Definir a chave da OpenAI na AWS Lambda automaticamente
+#%% 
+
+# Atualizar variável OPENAI_API_KEY na Lambda
 def update_lambda_environment():
     """
-    Atualiza as variáveis de ambiente da função AWS Lambda, garantindo que `OPENAI_API_KEY` esteja configurada.
+    Atualiza as variáveis de ambiente da função AWS Lambda.
+    Agora, verifica se a função realmente existe antes de tentar atualizar.
     """
     try:
-        # Obtendo as variáveis de ambiente já existentes na Lambda
-        response = lambda_client.get_function_configuration(FunctionName="StarWarsStoryLambda")
+        # Verifica se a função Lambda já existe antes de atualizar
+        response = lambda_client.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
+        current_env_vars = response.get("Configuration", {}).get("Environment", {}).get("Variables", {})
 
-        # Variáveis já existentes
-        current_env_vars = response.get("Environment", {}).get("Variables", {})
-
-        # Definir a chave OpenAI caso não exista
-        if "OPENAI_API_KEY" not in current_env_vars or not current_env_vars["OPENAI_API_KEY"]:
-            print("🔹 Definindo OPENAI_API_KEY na Lambda...")
-
-            # Atualizando variável de ambiente
-            current_env_vars["OPENAI_API_KEY"] = os.getenv("OPENAI_API_KEY")
+        if not current_env_vars.get("OPENAI_API_KEY"):
+            logger.info("🔹 Definindo OPENAI_API_KEY na Lambda...")
+            current_env_vars["OPENAI_API_KEY"] = OPENAI_API_KEY
 
             lambda_client.update_function_configuration(
-                FunctionName="StarWarsStoryLambda",
+                FunctionName=LAMBDA_FUNCTION_NAME,
                 Environment={"Variables": current_env_vars}
             )
 
-            print("✅ Variável OPENAI_API_KEY configurada na Lambda com sucesso!")
-            print("⏳ Aguardando propagação das variáveis...")
-            time.sleep(10)  # Espera para garantir que a chave foi propagada corretamente
+            logger.info("✅ Variável OPENAI_API_KEY configurada na Lambda com sucesso!")
+            time.sleep(10)
         else:
-            print("⚠️ OPENAI_API_KEY já está configurada na Lambda.")
+            logger.info("⚠️ OPENAI_API_KEY já está configurada na Lambda.")
 
+    except lambda_client.exceptions.ResourceNotFoundException:
+        logger.error(f"❌ Erro: A função '{LAMBDA_FUNCTION_NAME}' ainda não existe. Pulando atualização de variáveis.")
     except Exception as e:
-        print(f"❌ Erro ao configurar variáveis de ambiente na Lambda: {e}")
+        logger.error(f"❌ Erro ao configurar variáveis de ambiente na Lambda: {e}")
 
-# Atualiza a variável de ambiente antes de carregar a OpenAI
-update_lambda_environment()
+#%% 
 
-# Carregar a chave da API da OpenAI da variável de ambiente AWS
-openai.api_key = os.getenv("OPENAI_API_KEY")
-
-if not openai.api_key:
-    raise ValueError("❌ ERRO: A chave da OpenAI não foi carregada. Verifique as variáveis de ambiente da Lambda.")
-
-#%%
-# Código da Lambda corrigido para OpenAI 0.28.0
+# Código da Lambda otimizado para baixa latência
 LAMBDA_CODE = """import json
 import requests
 import openai
 import os
+import logging
+from concurrent.futures import ThreadPoolExecutor
+
+# Configuração do logger
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger()
 
 # Carregar a chave da API da OpenAI da variável de ambiente AWS
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 if not openai.api_key:
     raise ValueError("❌ ERRO: A chave da OpenAI não foi carregada. Verifique as variáveis de ambiente da Lambda.")
+
+def obter_info_star_wars(tipo, nome):
+    url = f"https://swapi.dev/api/{tipo}/?search={nome}"
+    response = requests.get(url)
+    if response.status_code == 200 and response.json()["count"] > 0:
+        return response.json()["results"][0]
+    return None
+
+def obter_varios_itens(tipo, nomes):
+    with ThreadPoolExecutor() as executor:
+        resultados = list(executor.map(lambda nome: obter_info_star_wars(tipo, nome), nomes))
+    return [item for item in resultados if item]
 
 def lambda_handler(event, context):
     try:
@@ -141,54 +155,48 @@ def lambda_handler(event, context):
         personagens = body.get("personagens", [])
         naves = body.get("naves", [])
         planetas = body.get("planetas", [])
+        ideias_extras = body.get("ideias_extras", "")
 
-        def obter_info_star_wars(tipo, nome):
-            url = f"https://swapi.dev/api/{tipo}/?search={nome}"
-            response = requests.get(url)
-            if response.status_code == 200 and response.json()["count"] > 0:
-                return response.json()["results"][0]
-            return None
+        dados_personagens = obter_varios_itens("people", personagens)
+        dados_naves = obter_varios_itens("starships", naves)
+        dados_planetas = obter_varios_itens("planets", planetas)
 
-        dados_personagens = [obter_info_star_wars("people", p) for p in personagens]
-        dados_naves = [obter_info_star_wars("starships", n) for n in naves]
-        dados_planetas = [obter_info_star_wars("planets", pl) for pl in planetas]
-
-        def gerar_historia(preferencias):
+        def gerar_historia(personagens, naves, planetas, ideias_extras):
             prompt = f\"\"\"
-Crie uma história envolvente no universo Star Wars considerando:
-- Personagens: {preferencias.get('personagens', 'Não informados')}
-- Naves: {preferencias.get('naves', 'Não informadas')}
-- Planetas: {preferencias.get('planetas', 'Não informados')}
+Crie uma história envolvente no universo Star Wars considerando os seguintes elementos:
+- Personagens: {personagens}
+- Naves: {naves}
+- Planetas: {planetas}
+- Ideias Extras: {ideias_extras}
 \"\"\"
-
             response = openai.ChatCompletion.create(
-                model="gpt-3.5-turbo",  # Ou "gpt-4" para uma resposta mais avançada
-                messages=[
-                    {"role": "system", "content": "Você é um escritor criativo no universo Star Wars."},
-                    {"role": "user", "content": prompt}
-                ],
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": prompt}],
                 temperature=0.7
             )
             return response["choices"][0]["message"]["content"].strip()
 
-        preferencias = {"personagens": dados_personagens, "naves": dados_naves, "planetas": dados_planetas}
-        historia = gerar_historia(preferencias)
+        historia = gerar_historia(dados_personagens, dados_naves, dados_planetas, ideias_extras)
 
-        return {"statusCode": 200, "body": json.dumps({"historia": historia}, ensure_ascii=False)}
+        return {
+            "statusCode": 200,
+            "body": json.dumps({"historia": historia}, ensure_ascii=False)
+        }
 
     except Exception as e:
-        return {"statusCode": 500, "body": json.dumps({"erro": str(e)})}
+        logger.error(f"Erro na execução da Lambda: {e}")
+        return {
+            "statusCode": 500,
+            "body": json.dumps({"erro": str(e)})
+        }
 """
 
-# Criar lambda_function.py
+# Criar `lambda_function.py` corretamente
 with open("lambda_function.py", "w", encoding="utf-8") as f:
     f.write(LAMBDA_CODE)
+logger.info("✅ Arquivo lambda_function.py criado com sucesso!")
 
-print("✅ Arquivo lambda_function.py criado com sucesso!")
-
-
-#%%
-# Criar o ZIP para a Lambda
+# Criar ZIP da Lambda
 def create_lambda_zip():
     install_dependencies()
     with zipfile.ZipFile("lambda_function.zip", "w", zipfile.ZIP_DEFLATED) as zipf:
@@ -196,7 +204,10 @@ def create_lambda_zip():
             for file in files:
                 zipf.write(os.path.join(root, file), os.path.relpath(os.path.join(root, file), "package"))
         zipf.write("lambda_function.py")
-    print("✅ Arquivo lambda_function.zip criado com sucesso!")
+    logger.info("✅ Arquivo lambda_function.zip criado com sucesso!")
+
+# Atualizar variável de ambiente na Lambda
+update_lambda_environment()
 
 #%%
 def get_lambda_arn():
@@ -211,46 +222,98 @@ def get_lambda_arn():
         return None
 
 #%%
+def create_lambda_role():
+    """
+    Cria ou atualiza a Role IAM da Lambda garantindo que todas as permissões necessárias estejam configuradas.
+    """
+    role_name = "StarWarsStoryLambdaRole"
 
-# Criar função Lambda
-def create_lambda():
     try:
-        with open("lambda_function.zip", "rb") as f:
-            zipped_code = f.read()
+        role = iam_client.get_role(RoleName=role_name)
+        print(f"✅ Role IAM '{role_name}' encontrada.")
 
+    except iam_client.exceptions.NoSuchEntityException:
+        print(f"🔹 Criando a Role IAM '{role_name}'...")
+        try:
+            response = iam_client.create_role(
+                RoleName=role_name,
+                AssumeRolePolicyDocument=json.dumps({
+                    "Version": "2012-10-17",
+                    "Statement": [
+                        {
+                            "Effect": "Allow",
+                            "Principal": {"Service": "lambda.amazonaws.com"},
+                            "Action": "sts:AssumeRole"
+                        }
+                    ]
+                })
+            )
+            print(f"✅ Role IAM '{role_name}' criada com sucesso.")
+            time.sleep(5)  # Pequena pausa para garantir propagação da Role
+        except Exception as e:
+            print(f"❌ Erro ao criar a Role '{role_name}': {e}")
+            return None
+
+    # Lista das permissões necessárias
+    required_policies = [
+        "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole",  # Logs no CloudWatch
+        "arn:aws:iam::aws:policy/AmazonSSMFullAccess",  # Acesso ao SSM Parameter Store (se necessário)
+        "arn:aws:iam::aws:policy/SecretsManagerReadWrite"  # Acesso ao AWS Secrets Manager
+    ]
+
+    # Lista permissões já anexadas
+    attached_policies = iam_client.list_attached_role_policies(RoleName=role_name)["AttachedPolicies"]
+    attached_arns = [policy["PolicyArn"] for policy in attached_policies]
+
+    # Adiciona apenas permissões que não estão anexadas
+    for policy in required_policies:
+        if policy not in attached_arns:
+            iam_client.attach_role_policy(RoleName=role_name, PolicyArn=policy)
+            print(f"✅ Permissão '{policy}' adicionada à Role '{role_name}'.")
+
+    print(f"✅ Role '{role_name}' está totalmente configurada e pronta para uso.")
+
+    # Aguarde a propagação da Role antes de usá-la
+    for _ in range(5):  # Tenta verificar a Role por 5 tentativas
+        try:
+            role = iam_client.get_role(RoleName=role_name)
+            print(f"✅ Role propagada com sucesso!")
+            break
+        except iam_client.exceptions.NoSuchEntityException:
+            print("🔄 Aguardando propagação da Role...")
+            time.sleep(5)
+
+    role = iam_client.get_role(RoleName=role_name)
+    return role["Role"]["Arn"]
+
+#%%
+def create_lambda():
+    """
+    Cria a função AWS Lambda com a Role correta e configura a integração.
+    """
+    lambda_role_arn = create_lambda_role()
+
+    try:
         response = lambda_client.create_function(
             FunctionName=LAMBDA_FUNCTION_NAME,
             Runtime="python3.9",
-            Role=create_lambda_role(),
+            Role=lambda_role_arn,  # Agora a Role é garantida antes da Lambda ser criada
             Handler="lambda_function.lambda_handler",
-            Code={"ZipFile": zipped_code},
+            Code={"ZipFile": open("lambda_function.zip", "rb").read()},
             Timeout=30
         )
+        logger.info(f"✅ Função Lambda '{LAMBDA_FUNCTION_NAME}' criada com sucesso.")
 
-        print(f"✅ Função Lambda criada com sucesso: {response['FunctionArn']}")
+        # 🔄 Aguarda alguns segundos para evitar erros de integração
+        logger.info("🔄 Aguardando a Lambda estar completamente disponível...")
+        time.sleep(5)  
+
         return response["FunctionArn"]
 
     except lambda_client.exceptions.ResourceConflictException:
-        print("⚠️ Função Lambda já existe. Obtendo ARN...")
-        return get_lambda_arn()
-
-#%%
-# Criar a Role da Lambda
-def create_lambda_role():
-    role_name = "StarWarsStoryLambdaRole"
-    try:
-        response = iam_client.create_role(
-            RoleName=role_name,
-            AssumeRolePolicyDocument=json.dumps({
-                "Version": "2012-10-17",
-                "Statement": [{"Effect": "Allow", "Principal": {"Service": "lambda.amazonaws.com"}, "Action": "sts:AssumeRole"}]
-            })
-        )
-        print(f"✅ Role IAM '{role_name}' criada com sucesso.")
-    except iam_client.exceptions.EntityAlreadyExistsException:
-        print(f"⚠️ Role IAM '{role_name}' já existe.")
-
-    return iam_client.get_role(RoleName=role_name)["Role"]["Arn"]
+        logger.warning(f"⚠️ A função Lambda '{LAMBDA_FUNCTION_NAME}' já existe. Obtendo ARN...")
+        response = lambda_client.get_function(FunctionName=LAMBDA_FUNCTION_NAME)
+        return response["Configuration"]["FunctionArn"]
 
 #%%
 def create_resource(api_id, parent_id, resource_path="story"):
@@ -399,14 +462,14 @@ def main():
     configurar o API Gateway e implantar a API na AWS.
     """
 
-    print("🔹 Atualizando variáveis de ambiente na Lambda...")
-    update_lambda_environment()  # 🔹 Adiciona automaticamente a chave OPENAI_API_KEY na AWS Lambda
-
     print("🔹 Criando pacote ZIP para Lambda...")
     create_lambda_zip()
 
     print("🔹 Criando função Lambda na AWS...")
     lambda_arn = create_lambda()
+
+    print("🔹 Atualizando variáveis de ambiente na Lambda...")
+    update_lambda_environment()
 
     print("🔹 Criando API Gateway...")
     api_id, root_id = create_api_gateway()
