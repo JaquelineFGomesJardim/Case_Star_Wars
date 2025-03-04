@@ -10,4 +10,4 @@ O objetivo principal deste projeto é criar um modelo LLM capaz de gerar narrati
 •	Gera narrativas personalizadas a partir de prompts detalhados, limitando o escopo do modelo à criação de histórias.
 •	Cria um endpoint na AWS que permite aos usuários consultar as histórias geradas enviando informações sobre personagens, planetas e naves no corpo da requisição.
 •	Utiliza os serviços AWS Lambda e API Gateway para garantir escalabilidade e flexibilidade na solução.
->>>>>>> master
+
